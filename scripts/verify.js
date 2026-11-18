@@ -188,6 +188,50 @@ async function main() {
     'Col1,Col2\r\nCafé,"1,234"'
   );
 
+  // Filename safety: surrogate-pair boundary, control chars, reserved names, dot-dot, byte cap.
+  const surrogateBoundaryTitle = 'A'.repeat(59) + '📊Tail';
+  const safeSurrogate = sandbox.sanitizeFilenamePart(surrogateBoundaryTitle, 'Webpage', 60);
+  assert.strictEqual(safeSurrogate.isWellFormed(), true);
+
+  assert.strictEqual(sandbox.sanitizeFilenamePart('CON', 'Webpage'), 'Webpage');
+  assert.strictEqual(sandbox.sanitizeFilenamePart('nul', 'Table_1'), 'Table_1');
+  assert.strictEqual(sandbox.sanitizeFilenamePart('...\u200B\u202E\x7F...', 'Webpage'), 'Webpage');
+  assert.strictEqual(sandbox.sanitizeFilenamePart('foo/../bar', 'Webpage'), 'foo_bar');
+
+  // Long multi-byte CJK title + table name must stay well within OS 255-byte limit.
+  const longCjk = '日本語テスト表データ'.repeat(10);
+  const cjkFile = sandbox.buildSafeFilename(
+    sandbox.sanitizeFilenamePart(longCjk, 'Webpage'),
+    sandbox.sanitizeFilenamePart(longCjk, 'Table_1'),
+    'xlsx'
+  );
+  assert(Buffer.byteLength(cjkFile, 'utf8') <= 140, `Filename too long: ${cjkFile}`);
+  assert.strictEqual(cjkFile.isWellFormed(), true);
+
+  // Automatic ASCII fallback retry if Chrome rejects a Unicode filename as Invalid filename.
+  downloads.length = 0;
+  let rejectFirst = true;
+  const origDownload = sandbox.chrome.downloads.download;
+  sandbox.chrome.downloads.download = (opts, cb) => {
+    if (rejectFirst) {
+      rejectFirst = false;
+      sandbox.chrome.runtime.lastError = { message: 'Invalid filename' };
+      cb(undefined);
+      sandbox.chrome.runtime.lastError = null;
+      return;
+    }
+    origDownload(opts, cb);
+  };
+  const retryRes = await dispatchExport({
+    action: 'EXPORT_TABLES',
+    mode: 'single',
+    pageTitle: 'Café 📊 Report',
+    format: 'csv',
+    tables: [{ name: '日本語', rows: [['A'], ['1']] }]
+  });
+  sandbox.chrome.downloads.download = origDownload;
+  assert.strictEqual(retryRes.filenames[0], 'Caf_Report.csv');
+
   console.log('All verification checks passed.');
 }
 

@@ -5,8 +5,11 @@ importScripts('lib/xlsx.full.min.js');
 const STORAGE_FORMAT_KEY = 'exportFormat';
 const DEFAULT_FORMAT = 'xlsx';
 const EXCEL_SHEET_MAX_LEN = 31;
+const MAX_FILENAME_BYTES = 140;
+const MAX_PART_BYTES = 60;
 const FORBIDDEN_SHEET_CHARS_RE = /[\\/?*[\]:]/g;
-const FORBIDDEN_FILENAME_CHARS_RE = /[<>:"/\\|?*\x00-\x1F]/g;
+const FORBIDDEN_FILENAME_CHARS_RE = /[<>:"/\\|?*\x00-\x1F\x7F-\x9F]/g;
+const WINDOWS_RESERVED_NAME_RE = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 const MIME_XLSX = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 const MIME_CSV = 'text/csv;charset=utf-8';
 
@@ -40,24 +43,94 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 /**
- * Sanitize a string for safe use as a filename segment.
+ * Truncate a string cleanly by Unicode code points and UTF-8 byte length.
  */
-function sanitizeFilenamePart(raw, fallback, maxLen = 60) {
-  const cleaned = String(raw || '')
-    .replace(FORBIDDEN_FILENAME_CHARS_RE, '_')
-    .replace(/\s+/g, '_')
-    .replace(/_+/g, '_')
-    .replace(/^[._]+|[._]+$/g, '');
+function truncateUtf8(str, maxChars, maxBytes) {
+  const encoder = new TextEncoder();
+  const chars = Array.from(str);
+  let out = '';
+  let byteCount = 0;
 
-  const truncated = cleaned.slice(0, maxLen).replace(/[._]+$/g, '');
-  return truncated || fallback;
+  for (let i = 0; i < chars.length && i < maxChars; i += 1) {
+    const ch = chars[i];
+    const chBytes = encoder.encode(ch).length;
+    if (byteCount + chBytes > maxBytes) {
+      break;
+    }
+    out += ch;
+    byteCount += chBytes;
+  }
+
+  return out;
 }
 
 /**
- * Deduplicate a filename stem while preserving a concise maximum length.
+ * Strip lone UTF-16 surrogates and invisible Unicode format/control characters.
  */
-function getUniqueFilenameStem(baseStem, usedLowerStems, maxLen = 50) {
-  const normalizedBase = baseStem.slice(0, maxLen).replace(/[._]+$/g, '') || 'Table';
+function stripUnsafeUnicode(raw) {
+  const str = String(raw || '');
+  const wellFormed = typeof str.toWellFormed === 'function' ? str.toWellFormed() : str.replace(/[\uD800-\uDFFF]/g, '');
+  return wellFormed.replace(/[\p{Cc}\p{Cf}\uFFFD]/gu, '');
+}
+
+/**
+ * Sanitize a string for safe use as a filename segment.
+ */
+function sanitizeFilenamePart(raw, fallback, maxChars = 60, maxBytes = MAX_PART_BYTES) {
+  const cleaned = stripUnsafeUnicode(raw)
+    .replace(FORBIDDEN_FILENAME_CHARS_RE, '_')
+    .replace(/\.{2,}/g, '_')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^[._-]+|[._-]+$/g, '');
+
+  let truncated = truncateUtf8(cleaned, maxChars, maxBytes).replace(/^[._-]+|[._-]+$/g, '');
+  if (!truncated || WINDOWS_RESERVED_NAME_RE.test(truncated)) {
+    return fallback;
+  }
+  return truncated;
+}
+
+/**
+ * Build a complete filename guaranteed to fit within OS byte and character limits.
+ */
+function buildSafeFilename(pagePart, tablePart, ext) {
+  const safeExt = ext === 'csv' ? 'csv' : 'xlsx';
+  const suffix = `_${tablePart}.${safeExt}`;
+  const suffixBytes = new TextEncoder().encode(suffix).length;
+  const maxPageBytes = Math.max(16, MAX_FILENAME_BYTES - suffixBytes);
+  const fittedPage = truncateUtf8(pagePart, 60, maxPageBytes).replace(/^[._-]+|[._-]+$/g, '') || 'Webpage';
+  let stem = `${fittedPage}_${tablePart}`.replace(/^[._-]+|[._-]+$/g, '');
+
+  if (!stem || WINDOWS_RESERVED_NAME_RE.test(stem)) {
+    stem = `DTable_Export`;
+  }
+  return `${stem}.${safeExt}`;
+}
+
+/**
+ * Create a strict ASCII-only fallback filename if the OS rejects Unicode characters.
+ */
+function toAsciiFilename(filename) {
+  const dotIdx = filename.lastIndexOf('.');
+  const rawStem = dotIdx > 0 ? filename.slice(0, dotIdx) : filename;
+  const ext = dotIdx > 0 ? filename.slice(dotIdx) : '';
+  const asciiStem = rawStem
+    .replace(/[^A-Za-z0-9_-]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 100);
+  const safeStem = !asciiStem || WINDOWS_RESERVED_NAME_RE.test(asciiStem) ? 'DTable_Export' : asciiStem;
+  return `${safeStem}${ext}`;
+}
+
+/**
+ * Deduplicate a filename stem while preserving Unicode code point and byte limits.
+ */
+function getUniqueFilenameStem(baseStem, usedLowerStems, maxChars = 50, maxBytes = MAX_PART_BYTES) {
+  const normalizedBase =
+    truncateUtf8(baseStem, maxChars, maxBytes).replace(/^[._-]+|[._-]+$/g, '') || 'Table';
+
   if (!usedLowerStems.has(normalizedBase.toLowerCase())) {
     usedLowerStems.add(normalizedBase.toLowerCase());
     return normalizedBase;
@@ -66,8 +139,12 @@ function getUniqueFilenameStem(baseStem, usedLowerStems, maxLen = 50) {
   let counter = 2;
   while (true) {
     const suffix = `_(${counter})`;
-    const allowedBase = Math.max(1, maxLen - suffix.length);
-    const candidate = `${normalizedBase.slice(0, allowedBase).replace(/[._]+$/g, '') || 'Table'}${suffix}`;
+    const suffixBytes = new TextEncoder().encode(suffix).length;
+    const allowedChars = Math.max(1, maxChars - suffix.length);
+    const allowedBytes = Math.max(4, maxBytes - suffixBytes);
+    const basePart =
+      truncateUtf8(normalizedBase, allowedChars, allowedBytes).replace(/^[._-]+|[._-]+$/g, '') || 'Table';
+    const candidate = `${basePart}${suffix}`;
     const lower = candidate.toLowerCase();
     if (!usedLowerStems.has(lower)) {
       usedLowerStems.add(lower);
@@ -78,10 +155,18 @@ function getUniqueFilenameStem(baseStem, usedLowerStems, maxLen = 50) {
 }
 
 /**
+ * Truncate a string by Unicode code point count without splitting surrogate pairs.
+ */
+function sliceCodePoints(str, maxChars) {
+  return Array.from(str).slice(0, maxChars).join('');
+}
+
+/**
  * Sanitize and deduplicate an Excel worksheet name according to Excel's 31-char limit.
  */
 function getUniqueSheetName(rawName, usedLowerNames, fallbackIndex) {
-  let base = String(rawName || '')
+  const safeRaw = stripUnsafeUnicode(rawName);
+  let base = safeRaw
     .replace(FORBIDDEN_SHEET_CHARS_RE, ' ')
     .replace(/\s+/g, ' ')
     .trim()
@@ -91,7 +176,9 @@ function getUniqueSheetName(rawName, usedLowerNames, fallbackIndex) {
     base = `Table ${fallbackIndex}`;
   }
 
-  const truncated = base.slice(0, EXCEL_SHEET_MAX_LEN).trim().replace(/^'+|'+$/g, '') || `Table ${fallbackIndex}`;
+  const truncated =
+    sliceCodePoints(base, EXCEL_SHEET_MAX_LEN).trim().replace(/^'+|'+$/g, '') ||
+    `Table ${fallbackIndex}`;
   if (!usedLowerNames.has(truncated.toLowerCase())) {
     usedLowerNames.add(truncated.toLowerCase());
     return truncated;
@@ -101,7 +188,8 @@ function getUniqueSheetName(rawName, usedLowerNames, fallbackIndex) {
   while (true) {
     const suffix = ` (${counter})`;
     const maxBaseLen = Math.max(1, EXCEL_SHEET_MAX_LEN - suffix.length);
-    const trimmedBase = truncated.slice(0, maxBaseLen).trimEnd().replace(/^'+|'+$/g, '') || 'T';
+    const trimmedBase =
+      sliceCodePoints(truncated, maxBaseLen).trimEnd().replace(/^'+|'+$/g, '') || 'T';
     const candidate = `${trimmedBase}${suffix}`;
     const lower = candidate.toLowerCase();
     if (!usedLowerNames.has(lower)) {
@@ -176,25 +264,36 @@ function utf8ToBase64(text) {
 }
 
 /**
- * Trigger a Chrome automatic download for a data URL.
+ * Trigger a Chrome automatic download for a data URL, retrying with an ASCII-safe name if rejected.
  */
 function downloadDataUrl(url, filename) {
-  return new Promise((resolve, reject) => {
-    chrome.downloads.download(
-      {
-        url,
-        filename,
-        saveAs: false,
-        conflictAction: 'uniquify'
-      },
-      (downloadId) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
+  const attemptDownload = (targetName) =>
+    new Promise((resolve, reject) => {
+      chrome.downloads.download(
+        {
+          url,
+          filename: targetName,
+          saveAs: false,
+          conflictAction: 'uniquify'
+        },
+        (downloadId) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+          resolve({ downloadId, filename: targetName });
         }
-        resolve(downloadId);
+      );
+    });
+
+  return attemptDownload(filename).catch((err) => {
+    if (err && /invalid filename/i.test(err.message)) {
+      const fallbackName = toAsciiFilename(filename);
+      if (fallbackName !== filename) {
+        return attemptDownload(fallbackName);
       }
-    );
+    }
+    throw err;
   });
 }
 
@@ -235,13 +334,12 @@ async function handleExport({ tables, mode, pageTitle, format }) {
       compression: true
     });
 
-    const filename =
-      mode === 'single'
-        ? `${safePageTitle}_${sanitizeFilenamePart(tables[0].name, 'Table_1', 50)}.xlsx`
-        : `${safePageTitle}_DTable.xlsx`;
+    const tablePart =
+      mode === 'single' ? sanitizeFilenamePart(tables[0].name, 'Table_1', 50) : 'DTable';
+    const filename = buildSafeFilename(safePageTitle, tablePart, 'xlsx');
 
-    await downloadDataUrl(`data:${MIME_XLSX};base64,${base64}`, filename);
-    return { count: 1, filenames: [filename] };
+    const result = await downloadDataUrl(`data:${MIME_XLSX};base64,${base64}`, filename);
+    return { count: 1, filenames: [result.filename] };
   }
 
   // CSV mode: export one file per table with deduplicated filenames.
@@ -252,12 +350,12 @@ async function handleExport({ tables, mode, pageTitle, format }) {
     const table = tables[i];
     const rawTableStem = sanitizeFilenamePart(table.name, `Table_${i + 1}`, 50);
     const uniqueStem = getUniqueFilenameStem(rawTableStem, usedCsvStems, 50);
-    const filename = `${safePageTitle}_${uniqueStem}.csv`;
+    const filename = buildSafeFilename(safePageTitle, uniqueStem, 'csv');
 
     const csvContent = serializeCsv(Array.isArray(table.rows) ? table.rows : []);
     const base64 = utf8ToBase64(csvContent);
-    await downloadDataUrl(`data:${MIME_CSV};base64,${base64}`, filename);
-    filenames.push(filename);
+    const result = await downloadDataUrl(`data:${MIME_CSV};base64,${base64}`, filename);
+    filenames.push(result.filename);
   }
 
   return { count: filenames.length, filenames };
