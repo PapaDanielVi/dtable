@@ -9,6 +9,10 @@
   const SHADOW_HOST_ID = 'dtable-shadow-host';
   const SCROLL_HIGHLIGHT_CLASS = 'dtable-scroll-highlight';
   const HEADING_SELECTOR = 'h1, h2, h3, h4, h5, h6';
+  const ARIA_TABLE_SELECTOR = '[role="table"], [role="grid"], [role="treegrid"]';
+  const ARIA_CELL_SELECTOR = '[role="columnheader"], [role="rowheader"], [role="gridcell"], [role="cell"]';
+  const ROW_VERTICAL_TOLERANCE_PX = 4;
+  const COL_ALIGNMENT_TOLERANCE_PX = 12;
   const SECTION_TAGS = new Set([
     'SECTION',
     'ARTICLE',
@@ -177,7 +181,11 @@
           if (text) return text;
         }
 
-        if (prev.tagName === 'TABLE' || (prev.querySelector && prev.querySelector('table'))) {
+        if (
+          prev.tagName === 'TABLE' ||
+          (prev.matches && prev.matches(ARIA_TABLE_SELECTOR)) ||
+          (prev.querySelector && prev.querySelector(`table, ${ARIA_TABLE_SELECTOR}`))
+        ) {
           break;
         }
 
@@ -417,30 +425,664 @@
   }
 
   /**
-   * Scan the active document for valid, visible, non-empty HTML tables.
+   * Check whether a candidate element overlaps (contains or is inside) any already-detected table.
    */
-  function scanValidTables() {
-    const allTables = Array.from(document.querySelectorAll('table'));
-    const valid = [];
+  function overlapsDetectedElement(el, detectedSet) {
+    for (const existing of detectedSet) {
+      if (existing === el || existing.contains(el) || el.contains(existing)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
-    for (const table of allTables) {
-      if (!isTableVisible(table)) continue;
-      const matrix = extractTableMatrix(table);
-      if (!matrix.hasContent || matrix.rowCount === 0 || matrix.colCount === 0) {
-        continue;
+  /**
+   * Build a uniform 2D cell grid and SheetJS merge ranges from row cell arrays.
+   */
+  function buildMatrixFromCellRows(rowCellLists, getSpanAndColIndex) {
+    const grid = [];
+    const occupied = [];
+    const merges = [];
+    const totalRows = rowCellLists.length;
+    let maxCols = 0;
+    let hasContent = false;
+
+    const ensureRow = (r) => {
+      if (!grid[r]) grid[r] = [];
+      if (!occupied[r]) occupied[r] = [];
+    };
+
+    for (let r = 0; r < totalRows; r += 1) {
+      ensureRow(r);
+      let c = 0;
+      const cells = rowCellLists[r];
+
+      for (let i = 0; i < cells.length; i += 1) {
+        const cell = cells[i];
+        const info = getSpanAndColIndex ? getSpanAndColIndex(cell) : null;
+        const explicitCol = info && info.colIndex >= 0 ? info.colIndex : -1;
+
+        if (explicitCol > c) {
+          c = explicitCol;
+        }
+        while (occupied[r][c]) {
+          c += 1;
+        }
+
+        const colspan = info && info.colspan > 0 ? info.colspan : 1;
+        const rawRowspan = info && info.rowspan > 0 ? info.rowspan : 1;
+        const rowspan = Math.min(rawRowspan, totalRows - r);
+
+        const text = cleanNodeText(cell);
+        if (text) {
+          hasContent = true;
+        }
+
+        for (let dr = 0; dr < rowspan; dr += 1) {
+          const targetRow = r + dr;
+          ensureRow(targetRow);
+          for (let dc = 0; dc < colspan; dc += 1) {
+            const targetCol = c + dc;
+            occupied[targetRow][targetCol] = true;
+            grid[targetRow][targetCol] = dr === 0 && dc === 0 ? text : '';
+          }
+        }
+
+        if (rowspan > 1 || colspan > 1) {
+          merges.push({
+            s: { r, c },
+            e: { r: r + rowspan - 1, c: c + colspan - 1 }
+          });
+        }
+
+        c += colspan;
+        if (c > maxCols) {
+          maxCols = c;
+        }
       }
 
+      if (occupied[r].length > maxCols) {
+        maxCols = occupied[r].length;
+      }
+    }
+
+    for (let r = 0; r < grid.length; r += 1) {
+      ensureRow(r);
+      for (let c = 0; c < maxCols; c += 1) {
+        if (grid[r][c] === undefined) {
+          grid[r][c] = '';
+        }
+      }
+    }
+
+    return {
+      rows: grid,
+      merges,
+      rowCount: grid.length,
+      colCount: maxCols,
+      hasContent
+    };
+  }
+
+  /**
+   * Filter out card grids, media galleries, and non-tabular blocks from heuristic results.
+   */
+  function passesDataTableHeuristics(container, matrix, rowElements, cellElements, hasHeaderSignal) {
+    if (!matrix.hasContent || matrix.colCount < 2) {
+      return false;
+    }
+    const minRows = hasHeaderSignal ? 2 : 3;
+    if (matrix.rowCount < minRows) {
+      return false;
+    }
+
+    // Reject navigation bars or footer links unless clearly multi-row data
+    if (container.closest('nav') && matrix.rowCount < 4) {
+      return false;
+    }
+
+    // Reject media/product card grids (large images/videos inside cells)
+    let totalTextLen = 0;
+    let nonEmptyCells = 0;
+    for (let i = 0; i < cellElements.length; i += 1) {
+      const cell = cellElements[i];
+      if (!cell) continue;
+      const media = cell.querySelector('img, video, canvas');
+      if (media) {
+        const mediaRect = media.getBoundingClientRect();
+        if (mediaRect.width >= 64 && mediaRect.height >= 64) {
+          return false;
+        }
+      }
+      const text = cleanNodeText(cell);
+      if (text) {
+        totalTextLen += text.length;
+        nonEmptyCells += 1;
+      }
+    }
+
+    if (nonEmptyCells === 0) {
+      return false;
+    }
+
+    // Reject tall multi-paragraph card layouts
+    const avgLen = totalTextLen / nonEmptyCells;
+    if (avgLen > 280) {
+      return false;
+    }
+
+    if (rowElements && rowElements.length > 0) {
+      const heights = rowElements.map((r) => r.getBoundingClientRect().height).sort((a, b) => a - b);
+      const medianHeight = heights[Math.floor(heights.length / 2)];
+      if (medianHeight > 200 && avgLen > 120) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * Check whether the first row looks visually distinct as a table header.
+   */
+  function hasDistinctHeaderRow(rowElements) {
+    if (!rowElements || rowElements.length < 2) return false;
+    const first = rowElements[0];
+    const second = rowElements[1];
+    if (first.querySelector('[role="columnheader"]')) {
+      return true;
+    }
+
+    const s1 = window.getComputedStyle(first);
+    const s2 = window.getComputedStyle(second);
+    const w1 = parseInt(s1.fontWeight, 10) || 400;
+    const w2 = parseInt(s2.fontWeight, 10) || 400;
+    if (w1 >= 600 && w1 > w2) return true;
+    if (s1.backgroundColor !== s2.backgroundColor) return true;
+    if (parseFloat(s1.borderBottomWidth) > 0 && s1.borderBottomWidth !== s2.borderBottomWidth) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Extract an ARIA table/grid ([role="table"|"grid"|"treegrid"]).
+   */
+  function extractAriaTableMatrix(container) {
+    const allRows = Array.from(container.querySelectorAll('[role="row"]')).filter(
+      (row) => row.closest(`table, ${ARIA_TABLE_SELECTOR}`) === container && isTableVisible(row)
+    );
+    if (allRows.length < 2) return null;
+
+    const rowCellLists = [];
+    for (const row of allRows) {
+      const cells = Array.from(row.querySelectorAll(ARIA_CELL_SELECTOR)).filter(
+        (cell) => cell.closest('[role="row"]') === row && isTableVisible(cell)
+      );
+      if (cells.length > 0) {
+        rowCellLists.push(cells);
+      }
+    }
+    if (rowCellLists.length < 2) return null;
+
+    const matrix = buildMatrixFromCellRows(rowCellLists, (cell) => {
+      const colIndexAttr = parseInt(cell.getAttribute('aria-colindex') || '0', 10);
+      const colspanAttr = parseInt(cell.getAttribute('aria-colspan') || '1', 10);
+      const rowspanAttr = parseInt(cell.getAttribute('aria-rowspan') || '1', 10);
+      return {
+        colIndex: Number.isFinite(colIndexAttr) && colIndexAttr > 0 ? colIndexAttr - 1 : -1,
+        colspan: Number.isFinite(colspanAttr) && colspanAttr > 0 ? colspanAttr : 1,
+        rowspan: Number.isFinite(rowspanAttr) && rowspanAttr > 0 ? rowspanAttr : 1
+      };
+    });
+
+    if (!matrix.hasContent || matrix.colCount < 2 || matrix.rowCount < 2) {
+      return null;
+    }
+    return matrix;
+  }
+
+  /**
+   * Extract a CSS display:table / inline-table structure.
+   */
+  function extractCssTableMatrix(container) {
+    const headerRows = [];
+    const bodyRows = [];
+    const footerRows = [];
+
+    for (const child of Array.from(container.children)) {
+      if (!isTableVisible(child)) continue;
+      const d = window.getComputedStyle(child).display;
+      if (d === 'table-header-group') {
+        for (const r of Array.from(child.children)) {
+          if (isTableVisible(r) && window.getComputedStyle(r).display === 'table-row') {
+            headerRows.push(r);
+          }
+        }
+      } else if (d === 'table-row-group') {
+        for (const r of Array.from(child.children)) {
+          if (isTableVisible(r) && window.getComputedStyle(r).display === 'table-row') {
+            bodyRows.push(r);
+          }
+        }
+      } else if (d === 'table-footer-group') {
+        for (const r of Array.from(child.children)) {
+          if (isTableVisible(r) && window.getComputedStyle(r).display === 'table-row') {
+            footerRows.push(r);
+          }
+        }
+      } else if (d === 'table-row') {
+        bodyRows.push(child);
+      }
+    }
+
+    const allRows = [...headerRows, ...bodyRows, ...footerRows];
+    if (allRows.length < 2) return null;
+
+    const rowCellLists = allRows
+      .map((row) =>
+        Array.from(row.children).filter(
+          (cell) => isTableVisible(cell) && window.getComputedStyle(cell).display === 'table-cell'
+        )
+      )
+      .filter((cells) => cells.length > 0);
+
+    if (rowCellLists.length < 2) return null;
+
+    const matrix = buildMatrixFromCellRows(rowCellLists, null);
+    if (!matrix.hasContent || matrix.colCount < 2 || matrix.rowCount < 2) {
+      return null;
+    }
+    return matrix;
+  }
+
+  /**
+   * Flatten direct children while unwrapping CSS display:contents wrappers.
+   */
+  function getVisibleFlowChildren(container, maxDepth = 2) {
+    const result = [];
+    for (const child of Array.from(container.children)) {
+      if (SKIP_TAGS.has(child.tagName) || child.id === SHADOW_HOST_ID) continue;
+      const style = window.getComputedStyle(child);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      if (style.position === 'absolute' || style.position === 'fixed') continue;
+      if (style.display === 'contents' && maxDepth > 0) {
+        result.push(...getVisibleFlowChildren(child, maxDepth - 1));
+      } else if (isTableVisible(child)) {
+        result.push(child);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Extract a flat CSS Grid table (display: grid with grid-template-columns).
+   */
+  function extractCssGridMatrix(container, containerStyle) {
+    const rawTracks = (containerStyle.gridTemplateColumns || '').trim();
+    if (!rawTracks || rawTracks === 'none') return null;
+
+    const trackWidths = rawTracks
+      .split(/\s+/)
+      .map((token) => parseFloat(token))
+      .filter((n) => Number.isFinite(n) && n > 0);
+
+    if (trackWidths.length < 2) return null;
+
+    const items = getVisibleFlowChildren(container);
+    if (items.length < trackWidths.length * 2) return null;
+
+    const itemEntries = items.map((el) => ({ el, rect: el.getBoundingClientRect() }));
+    itemEntries.sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left);
+
+    // Group grid items into visual rows by vertical top coordinate
+    const visualRows = [];
+    for (const item of itemEntries) {
+      const lastRow = visualRows[visualRows.length - 1];
+      if (!lastRow || Math.abs(item.rect.top - lastRow.top) > ROW_VERTICAL_TOLERANCE_PX) {
+        visualRows.push({ top: item.rect.top, items: [item] });
+      } else {
+        lastRow.items.push(item);
+      }
+    }
+
+    if (visualRows.length < 2) return null;
+
+    // Compute pixel track boundaries anchored at the leftmost grid item
+    let minLeft = Infinity;
+    for (const item of itemEntries) {
+      if (item.rect.left < minLeft) minLeft = item.rect.left;
+    }
+    const colGap = parseFloat(containerStyle.columnGap) || 0;
+    const trackBounds = [];
+    let cursorX = minLeft;
+    for (let i = 0; i < trackWidths.length; i += 1) {
+      trackBounds.push({ start: cursorX, end: cursorX + trackWidths[i] });
+      cursorX += trackWidths[i] + colGap;
+    }
+
+    const rowCellLists = [];
+    const rowHeaderWrappers = [];
+    for (const vRow of visualRows) {
+      vRow.items.sort((a, b) => a.rect.left - b.rect.left);
+      rowCellLists.push(vRow.items.map((x) => x.el));
+      rowHeaderWrappers.push(vRow.items[0].el);
+    }
+
+    const itemRectMap = new Map(itemEntries.map((x) => [x.el, x.rect]));
+    const matrix = buildMatrixFromCellRows(rowCellLists, (cell) => {
+      const rect = itemRectMap.get(cell);
+      if (!rect) return null;
+      let startCol = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < trackBounds.length; i += 1) {
+        const dist = Math.abs(rect.left - trackBounds[i].start);
+        if (dist < bestDist) {
+          bestDist = dist;
+          startCol = i;
+        }
+      }
+      let span = 1;
+      for (let i = startCol + 1; i < trackBounds.length; i += 1) {
+        if (rect.right > trackBounds[i].start + trackWidths[i] * 0.35) {
+          span += 1;
+        } else {
+          break;
+        }
+      }
+      return { colIndex: startCol, colspan: span, rowspan: 1 };
+    });
+
+    const headerSignal = hasDistinctHeaderRow(rowHeaderWrappers);
+    if (!passesDataTableHeuristics(container, matrix, null, items, headerSignal)) {
+      return null;
+    }
+    return matrix;
+  }
+
+  /**
+   * Unwrap single-child anchor/row wrapper around cells if a row has exactly one wrapper child.
+   */
+  function getRowCellElements(rowEl) {
+    let current = rowEl;
+    for (let depth = 0; depth < 2; depth += 1) {
+      const children = getVisibleFlowChildren(current, 1);
+      if (children.length === 1 && children[0].children.length >= 2) {
+        current = children[0];
+      } else {
+        return children;
+      }
+    }
+    return getVisibleFlowChildren(current, 1);
+  }
+
+  /**
+   * Collect candidate row elements for flex/div tables, flattening 1-level header/body group wrappers.
+   */
+  function collectGeometricRowCandidates(container) {
+    const direct = getVisibleFlowChildren(container, 1);
+    if (direct.length >= 2 && direct.length <= 3) {
+      const flattened = [];
+      let usedFlattening = false;
+      for (const child of direct) {
+        const grandChildren = getVisibleFlowChildren(child, 1);
+        const childCells = getRowCellElements(child);
+        if (
+          grandChildren.length >= 2 &&
+          grandChildren.every((gc) => getRowCellElements(gc).length >= 2) &&
+          childCells.length !== getRowCellElements(grandChildren[0]).length
+        ) {
+          flattened.push(...grandChildren);
+          usedFlattening = true;
+        } else {
+          flattened.push(child);
+        }
+      }
+      if (usedFlattening && flattened.length >= 2) {
+        return flattened;
+      }
+    }
+    return direct;
+  }
+
+  /**
+   * Check whether cells in every row lie horizontally and columns align vertically across rows.
+   */
+  function verifyColumnAlignment(rowCellsWithRects) {
+    const colCount = rowCellsWithRects[0].length;
+    if (colCount < 2) return false;
+
+    for (const row of rowCellsWithRects) {
+      if (row.length !== colCount) return false;
+      for (let c = 1; c < colCount; c += 1) {
+        if (row[c].rect.left < row[c - 1].rect.right - 4) {
+          return false;
+        }
+      }
+    }
+
+    for (let c = 0; c < colCount; c += 1) {
+      let minLeft = Infinity;
+      let maxLeft = -Infinity;
+      let minRight = Infinity;
+      let maxRight = -Infinity;
+      let minCenter = Infinity;
+      let maxCenter = -Infinity;
+
+      for (const row of rowCellsWithRects) {
+        const r = row[c].rect;
+        const center = (r.left + r.right) / 2;
+        if (r.left < minLeft) minLeft = r.left;
+        if (r.left > maxLeft) maxLeft = r.left;
+        if (r.right < minRight) minRight = r.right;
+        if (r.right > maxRight) maxRight = r.right;
+        if (center < minCenter) minCenter = center;
+        if (center > maxCenter) maxCenter = center;
+      }
+
+      const aligned =
+        maxLeft - minLeft <= COL_ALIGNMENT_TOLERANCE_PX ||
+        maxRight - minRight <= COL_ALIGNMENT_TOLERANCE_PX ||
+        maxCenter - minCenter <= COL_ALIGNMENT_TOLERANCE_PX;
+      if (!aligned) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * Extract a geometric column-aligned div/flex/list table UI.
+   */
+  function extractFlexTableMatrix(container) {
+    const candidates = collectGeometricRowCandidates(container);
+    if (candidates.length < 2) return null;
+
+    const rowData = [];
+    let prevBottom = -Infinity;
+    for (const rowEl of candidates) {
+      const rect = rowEl.getBoundingClientRect();
+      if (rect.top < prevBottom - ROW_VERTICAL_TOLERANCE_PX) {
+        return null;
+      }
+      prevBottom = rect.bottom;
+
+      const cells = getRowCellElements(rowEl);
+      if (cells.length < 2) return null;
+      const cellEntries = cells
+        .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+        .sort((a, b) => a.rect.left - b.rect.left);
+      rowData.push({ rowEl, cells: cellEntries });
+    }
+
+    if (rowData.length < 2) return null;
+    if (!verifyColumnAlignment(rowData.map((r) => r.cells))) {
+      return null;
+    }
+
+    const rowCellLists = rowData.map((r) => r.cells.map((c) => c.el));
+    const allCells = rowCellLists.flat();
+    const rowElements = rowData.map((r) => r.rowEl);
+    const matrix = buildMatrixFromCellRows(rowCellLists, null);
+    const headerSignal = hasDistinctHeaderRow(rowElements);
+
+    if (!passesDataTableHeuristics(container, matrix, rowElements, allCells, headerSignal)) {
+      return null;
+    }
+    return matrix;
+  }
+
+  /**
+   * Try extracting a non-<table> element as a table structure by priority.
+   */
+  function tryExtractNonNativeTable(el) {
+    if (!el || el.tagName === 'TABLE' || el.tagName === 'SVG') return null;
+    if (SKIP_TAGS.has(el.tagName) || el.id === SHADOW_HOST_ID) return null;
+    if (!isTableVisible(el)) return null;
+
+    if (el.matches && el.matches(ARIA_TABLE_SELECTOR)) {
+      const matrix = extractAriaTableMatrix(el);
+      if (matrix) return { kind: 'aria', matrix };
+    }
+
+    const style = window.getComputedStyle(el);
+    if (style.display === 'table' || style.display === 'inline-table') {
+      const matrix = extractCssTableMatrix(el);
+      if (matrix) return { kind: 'css-table', matrix };
+    }
+
+    if (style.display === 'grid' || style.display === 'inline-grid') {
+      const matrix = extractCssGridMatrix(el, style);
+      if (matrix) return { kind: 'css-grid', matrix };
+    }
+
+    if (el.children.length >= 2) {
+      const matrix = extractFlexTableMatrix(el);
+      if (matrix) return { kind: 'flex-table', matrix };
+    }
+
+    return null;
+  }
+
+  /**
+   * Re-extract fresh matrix for a matched entry of any detected table kind.
+   */
+  function extractMatchedEntryMatrix(entry) {
+    if (!entry || !entry.element) return null;
+    if (entry.kind === 'table' || entry.element.tagName === 'TABLE') {
+      return extractTableMatrix(entry.element);
+    }
+    if (entry.kind === 'aria') {
+      return extractAriaTableMatrix(entry.element);
+    }
+    if (entry.kind === 'css-table') {
+      return extractCssTableMatrix(entry.element);
+    }
+    if (entry.kind === 'css-grid') {
+      return extractCssGridMatrix(entry.element, window.getComputedStyle(entry.element));
+    }
+    if (entry.kind === 'flex-table') {
+      return extractFlexTableMatrix(entry.element);
+    }
+    return null;
+  }
+
+  /**
+   * Scan the active document: native <table> tags first, then ARIA/CSS Grid/flex tables.
+   */
+  function scanValidTables() {
+    const valid = [];
+    const detectedElements = new Set();
+
+    const registerDetected = (element, kind, matrix) => {
       const fallbackIndex = valid.length + 1;
-      const name = resolveTableName(table, fallbackIndex);
+      const name = resolveTableName(element, fallbackIndex);
+      detectedElements.add(element);
       valid.push({
         index: valid.length,
-        element: table,
+        kind,
+        element,
         name,
         rowCount: matrix.rowCount,
         colCount: matrix.colCount,
         rows: matrix.rows,
         merges: matrix.merges
       });
+    };
+
+    // 1. Native <table> tags first (primary implementation)
+    const allTables = Array.from(document.querySelectorAll('table'));
+    for (const table of allTables) {
+      if (!isTableVisible(table)) continue;
+      const matrix = extractTableMatrix(table);
+      if (!matrix.hasContent || matrix.rowCount === 0 || matrix.colCount === 0) {
+        continue;
+      }
+      registerDetected(table, 'table', matrix);
+    }
+
+    // 2. ARIA table/grid/treegrid elements
+    const ariaTables = Array.from(document.querySelectorAll(ARIA_TABLE_SELECTOR));
+    for (const el of ariaTables) {
+      if (overlapsDetectedElement(el, detectedElements)) continue;
+      if (!isTableVisible(el)) continue;
+      const matrix = extractAriaTableMatrix(el);
+      if (matrix) {
+        registerDetected(el, 'aria', matrix);
+      }
+    }
+
+    // 3. CSS display:table, flat CSS Grid, and geometric flex/div tables
+    if (document.body) {
+      const isInsideDetected = (el) => {
+        for (const existing of detectedElements) {
+          if (existing === el || existing.contains(el)) return true;
+        }
+        return false;
+      };
+
+      const walk = (node) => {
+        if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
+        if (SKIP_TAGS.has(node.tagName) || node.tagName === 'SVG' || node.id === SHADOW_HOST_ID) {
+          return;
+        }
+        if (isInsideDetected(node)) {
+          return;
+        }
+        if (node.children.length === 0 || !isTableVisible(node)) {
+          return;
+        }
+
+        if (node.children.length >= 2 && !overlapsDetectedElement(node, detectedElements)) {
+          const style = window.getComputedStyle(node);
+          if (style.display === 'table' || style.display === 'inline-table') {
+            const matrix = extractCssTableMatrix(node);
+            if (matrix) {
+              registerDetected(node, 'css-table', matrix);
+              return;
+            }
+          } else if (style.display === 'grid' || style.display === 'inline-grid') {
+            const matrix = extractCssGridMatrix(node, style);
+            if (matrix) {
+              registerDetected(node, 'css-grid', matrix);
+              return;
+            }
+          } else {
+            const matrix = extractFlexTableMatrix(node);
+            if (matrix) {
+              registerDetected(node, 'flex-table', matrix);
+              return;
+            }
+          }
+        }
+
+        for (const child of Array.from(node.children)) {
+          walk(child);
+        }
+      };
+
+      walk(document.body);
     }
 
     lastScannedTables = valid;
@@ -758,11 +1400,13 @@
 
   /**
    * Find the innermost valid table element under a given DOM event target.
+   * Always checks native <table> elements first, then ARIA/CSS Grid/flex tables.
    */
   function findValidTableFromTarget(target) {
     if (!target || !(target instanceof Element)) return null;
     if (target.closest(`#${SHADOW_HOST_ID}`)) return null;
 
+    // 1. Native <table> tags first (primary implementation)
     let candidate = target.closest('table');
     while (candidate) {
       if (isTableVisible(candidate)) {
@@ -775,6 +1419,7 @@
           const fallbackIndex = lastScannedTables.length + 1;
           return {
             index: lastScannedTables.length,
+            kind: 'table',
             element: candidate,
             name: resolveTableName(candidate, fallbackIndex),
             rowCount: matrix.rowCount,
@@ -786,6 +1431,43 @@
       }
       candidate = candidate.parentElement ? candidate.parentElement.closest('table') : null;
     }
+
+    // 2. Cached non-<table> detections (ARIA, CSS table, CSS Grid, flex table), innermost first
+    let bestCached = null;
+    for (const entry of lastScannedTables) {
+      if (entry.kind === 'table' || !entry.element || !entry.element.isConnected) continue;
+      if (entry.element === target || entry.element.contains(target)) {
+        if (!bestCached || bestCached.element.contains(entry.element)) {
+          bestCached = entry;
+        }
+      }
+    }
+    if (bestCached) {
+      return bestCached;
+    }
+
+    // 3. Dynamic ancestor walk for newly rendered ARIA/CSS Grid/flex tables
+    let cursor = target;
+    let depth = 0;
+    while (cursor && cursor !== document.documentElement && depth < 12) {
+      const extracted = tryExtractNonNativeTable(cursor);
+      if (extracted) {
+        const fallbackIndex = lastScannedTables.length + 1;
+        return {
+          index: lastScannedTables.length,
+          kind: extracted.kind,
+          element: cursor,
+          name: resolveTableName(cursor, fallbackIndex),
+          rowCount: extracted.matrix.rowCount,
+          colCount: extracted.matrix.colCount,
+          rows: extracted.matrix.rows,
+          merges: extracted.matrix.merges
+        };
+      }
+      cursor = cursor.parentElement;
+      depth += 1;
+    }
+
     return null;
   }
 
@@ -793,24 +1475,19 @@
     if (!selectionState.active) return;
 
     const target = e.target;
-    if (target instanceof Element && target.closest(`#${SHADOW_HOST_ID}`)) {
+    if (!(target instanceof Element) || target.closest(`#${SHADOW_HOST_ID}`)) {
       selectionState.hoveredTable = null;
       selectionState.hoveredMeta = null;
       updateHighlightPosition();
       return;
     }
 
-    const tableEl = target instanceof Element ? target.closest('table') : null;
-    if (!tableEl) {
-      if (selectionState.hoveredTable !== null) {
-        selectionState.hoveredTable = null;
-        selectionState.hoveredMeta = null;
-        updateHighlightPosition();
-      }
-      return;
-    }
-
-    if (tableEl === selectionState.hoveredTable) {
+    const closestNativeTable = target.closest('table');
+    if (
+      selectionState.hoveredTable &&
+      (selectionState.hoveredTable === target || selectionState.hoveredTable.contains(target)) &&
+      (!closestNativeTable || closestNativeTable === selectionState.hoveredTable)
+    ) {
       updateHighlightPosition();
       return;
     }
@@ -863,7 +1540,12 @@
     e.stopImmediatePropagation();
 
     const exportFormat = selectionState.format;
-    const freshMatrix = extractTableMatrix(matched.element);
+    const freshMatrix = extractMatchedEntryMatrix(matched) || {
+      rows: matched.rows,
+      merges: matched.merges,
+      rowCount: matched.rowCount,
+      colCount: matched.colCount
+    };
     const payload = {
       name: matched.name,
       rows: freshMatrix.rows,

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DTable",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Extract HTML tables from any webpage and export them automatically as Excel (.xlsx) workbooks or RFC 4180 CSV files.",
   "permissions": [
     "activeTab",
